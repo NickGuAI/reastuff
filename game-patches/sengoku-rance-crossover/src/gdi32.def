@@ -1,0 +1,17 @@
+; SPDX-License-Identifier: MIT
+LIBRARY GDI32.dll
+EXPORTS
+CreateCompatibleDC@4
+CreateFontIndirectA@4
+SelectObject@8
+DeleteObject@4
+DeleteDC@4
+GetTextMetricsW@8
+GetGlyphOutlineW@28
+CreateDIBSection@24
+SetBkMode@8
+SetTextColor@8
+TextOutA@20
+GdiFlush@0
+GetCurrentObject@8
+GetObjectW@12
