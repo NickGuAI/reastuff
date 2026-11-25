@@ -113,6 +113,73 @@ class InstallerTests(unittest.TestCase):
         self.assertFalse((self.game / patch.BACKUP).exists())
         self.assertEqual(self.registry.values["WindowScalePercent"], 150)
 
+    def make_legacy_install(self):
+        patch.install(self.game, self.registry)
+        legacy = b"v0.1.0 test DLL (not executed)"
+        replacement = mock.patch.object(patch, "LEGACY_SHIM_HASH", patch.sha(legacy))
+        replacement.start()
+        self.addCleanup(replacement.stop)
+        (self.game / patch.SHIM).write_bytes(legacy)
+        manifest = patch.read_manifest(self.game)
+        manifest["after"][patch.SHIM] = patch.LEGACY_SHIM_HASH
+        manifest.pop("patch_version", None)
+        patch.save_manifest(self.game, manifest)
+        return legacy, manifest
+
+    def test_upgrade_changes_only_font_and_tracking(self):
+        legacy, before = self.make_legacy_install()
+        original_files = {name: (self.game / name).read_bytes() for name in patch.BEFORE}
+        self.registry.values["WindowScalePercent"] = 200
+        patch.upgrade(self.game)
+        patch.upgrade(self.game)
+        after = patch.read_manifest(self.game)
+        self.assertEqual(patch.digest(self.game / patch.SHIM), patch.SHIM_HASH)
+        self.assertEqual(after["settings_before"], before["settings_before"])
+        self.assertEqual(after["settings_applied"], before["settings_applied"])
+        self.assertEqual(self.registry.values["WindowScalePercent"], 200)
+        for name, data in original_files.items():
+            self.assertEqual((self.game / name).read_bytes(), data)
+        self.assertEqual((self.game / patch.BACKUP / "RanceTextFix.v0.1.0.dll").read_bytes(), legacy)
+        self.assertEqual((self.game / "SaveData/save.asd").read_bytes(), b"user progress")
+        patch.restore(self.game, self.registry, after)
+        self.assert_original()
+        self.assertEqual(self.registry.values["WindowScalePercent"], 200)
+
+    def test_upgrade_refuses_user_dll_edit(self):
+        self.make_legacy_install()
+        (self.game / patch.SHIM).write_bytes(b"user mod")
+        with self.assertRaisesRegex(RuntimeError, "text DLL changed"):
+            patch.upgrade(self.game)
+        self.assertEqual((self.game / patch.SHIM).read_bytes(), b"user mod")
+
+    def test_upgrade_refuses_changed_translation(self):
+        legacy, _ = self.make_legacy_install()
+        (self.game / "DLL/GBText.dll").write_bytes(b"new translation version")
+        with self.assertRaisesRegex(RuntimeError, "GBText.dll changed"):
+            patch.upgrade(self.game)
+        self.assertEqual((self.game / patch.SHIM).read_bytes(), legacy)
+
+    def test_upgrade_rolls_back_failed_manifest_write(self):
+        legacy, before = self.make_legacy_install()
+        with mock.patch.object(patch, "save_manifest", side_effect=OSError("injected failure")):
+            with self.assertRaisesRegex(RuntimeError, "previous state retained"):
+                patch.upgrade(self.game)
+        self.assertEqual((self.game / patch.SHIM).read_bytes(), legacy)
+        self.assertEqual(patch.read_manifest(self.game), before)
+
+    def test_upgrade_resumes_after_dll_write(self):
+        _, before = self.make_legacy_install()
+        (self.game / patch.SHIM).write_bytes(patch.bundled_shim())
+        patch.upgrade(self.game)
+        after = patch.read_manifest(self.game)
+        self.assertEqual(after["after"][patch.SHIM], patch.SHIM_HASH)
+        self.assertEqual(after["settings_before"], before["settings_before"])
+
+    def test_install_upgrades_previous_release(self):
+        self.make_legacy_install()
+        patch.install(self.game, self.registry)
+        self.assertEqual(patch.digest(self.game / patch.SHIM), patch.SHIM_HASH)
+
 
 if __name__ == "__main__":
     unittest.main()

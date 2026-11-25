@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Render real GBText glyphs into the engine-sized DIB, before and after the fix."""
+"""Check glyph clipping and baseline consistency through both real GDI paths."""
 from pathlib import Path
+import argparse
 import re
 import shutil
 import subprocess
@@ -17,41 +18,40 @@ def winpath(path):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bottle", default="Steam")
+    parser.add_argument("--game-dir", type=Path, default=GAME)
+    parser.add_argument("--dll", type=Path, default=ROOT / "bin/RanceTextFix.dll")
+    parser.add_argument("--preview-dir", type=Path, help="Keep the memory-rendered PGM sample and log")
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="sengoku-glyph-test-") as directory:
         fixture = Path(directory).resolve()
         (fixture / "DLL").mkdir()
-        shutil.copyfile(GAME / "DLL/GBText.dll", fixture / "DLL/GBText.dll")
-        shutil.copyfile(ROOT / "bin/RanceTextFix.dll", fixture / "DLL/RanceTextFix.dll")
+        shutil.copyfile(args.game_dir / "DLL/GBText.dll", fixture / "DLL/GBText.dll")
+        shutil.copyfile(args.dll, fixture / "DLL/RanceTextFix.dll")
         shutil.copyfile(ROOT / "bin/glyph-probe.exe", fixture / "glyph-probe.exe")
-        result = subprocess.run([WINE, "--bottle", "Steam", "--workdir", winpath(fixture),
-                                 "--cx-app", winpath(fixture / "glyph-probe.exe")],
-                                capture_output=True, text=True, errors="replace", timeout=60, check=True)
-    output = result.stdout
-    if "GBText only" not in output or "GBText plus patch" not in output:
-        raise AssertionError("The real GBText module or the patch could not be loaded:\n" + output)
-    before, after = output.split("GBText plus patch", 1)
-    pattern = re.compile(r"^(\w+) rows=(\d) size=(\d+) cell=\d+ ink_y=-?\d+\.\.-?\d+ "
-                         r"ink_x=(-?\d+)\.\.(-?\d+) total=(\d+)", re.M)
-    def results(section):
-        return {(name, int(rows)): (int(lo), int(hi), int(total))
-                for name, rows, _size, lo, hi, total in pattern.findall(section)}
-    baseline, fixed = results(before), results(after)
-    names = ("zhong", "guo", "wo", "men", "small", "large", "ascii",
-             "padded_guo", "padded_zhong", "padded_ascii", "mono_guo")
-    for name in names:
-        if fixed[(name, 1)][2] != fixed[(name, 2)][2]:
-            raise AssertionError(f"{name}: patched square buffer still loses ink")
-    if not any(baseline[(name, 1)][2] < baseline[(name, 2)][2] for name in names):
-        raise AssertionError("Control did not reproduce clipped glyphs")
-    for name in ("zhong", "guo", "wo", "men"):
-        old_width = baseline[(name, 1)][1] - baseline[(name, 1)][0] + 1
-        new_width = fixed[(name, 1)][1] - fixed[(name, 1)][0] + 1
-        if new_width <= old_width:
-            raise AssertionError(f"{name}: expected a wider natural glyph ({old_width} -> {new_width})")
-    print("PASS: eleven glyph cases fit square and padded 1/8/32-bit buffers; Chinese glyphs use their natural width.")
-    print("Control example (国, size 18):", baseline[("guo", 1)][2], "visible /",
-          baseline[("guo", 2)][2], "reference pixels; patched:", fixed[("guo", 1)][2], "/",
-          fixed[("guo", 2)][2])
+        result = subprocess.run([WINE, "--bottle", args.bottle, "--debugmsg", "-all,+debugstr",
+                                 "--workdir", winpath(fixture), "--cx-app",
+                                 winpath(fixture / "glyph-probe.exe")], capture_output=True,
+                                text=True, errors="replace", timeout=60, check=True)
+        if args.preview_dir:
+            args.preview_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(fixture / "after.pgm", args.preview_dir / "glyphs.pgm")
+            (args.preview_dir / "glyphs.log").write_text(result.stdout + result.stderr)
+    pattern = r"^(before|after) cases=(\d+) changed=(\d+) clipped=(\d+) empty=(\d+)$"
+    measurements = {phase: tuple(map(int, values)) for phase, *values in
+                    re.findall(pattern, result.stdout, re.M)}
+    expected_cases = 57 * 3 * 2 * 2 * 3 * 3
+    if set(measurements) != {"before", "after"}:
+        raise AssertionError("Incomplete GDI probe:\n" + result.stdout + result.stderr)
+    if measurements["before"][0] != expected_cases or not measurements["before"][2]:
+        raise AssertionError("The control did not reproduce the clipping defect")
+    if measurements["after"] != (expected_cases, 0, 0, 0):
+        raise AssertionError("Clipping or inconsistent placement remains:\n" +
+                             result.stdout + result.stderr)
+    print(f"PASS: {expected_cases} raster comparisons, with no clipping, shifted pixels, or empty glyphs.")
+    print("57 reported characters; sizes 12/18/24; normal/bold; square/padded 1/8/32-bit buffers;")
+    print("ANSI, Unicode, and Unicode with the game's trailing-NUL argument.")
 
 
 if __name__ == "__main__":

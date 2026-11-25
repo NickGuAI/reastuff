@@ -27,7 +27,9 @@ DEPENDENCIES = {
     "DLL/GBText.dll": "8e6640346d83bc757c2955763297d8497b346afcd9719fa02c813298dfa5cefe",
     "DLL/DrawText2.dll": "946481ca080cbbb3c407ac6276f7ca6c4e85f96d082f0556f7c73e8175e09912",
 }
-SHIM_HASH = "4f91a85ae31f2b206aa1e70da7a89f28bf15f654615f9f045362a448daf81b72"
+VERSION = "0.1.1"
+SHIM_HASH = "4e5244a0f0245ce91a24c02aef77a5b50eb2c5380fc1fc540ef78699a51b1552"
+LEGACY_SHIM_HASH = "4f91a85ae31f2b206aa1e70da7a89f28bf15f654615f9f045362a448daf81b72"
 SCALE_OFFSET = 0x13BFA
 SCALE_EXE_HASH = "20591ebd68be6ebe6a58d889f91554d92967e541837489b45e69d59ab01d2876"
 SETTINGS = {"FullScreen2": 0, "WindowScalePercent": 170}
@@ -88,13 +90,18 @@ class Registry:
             self.run("add", KEY, "/v", key, "/t", "REG_DWORD", "/d", str(value), "/f")
 
 
+def bundled_shim():
+    shim = (ROOT / "bin/RanceTextFix.dll").read_bytes()
+    if sha(shim) != SHIM_HASH:
+        raise RuntimeError("The bundled patch DLL differs from the tested build.")
+    return shim
+
+
 def make_changes(game):
     for name, expected in {**BEFORE, **DEPENDENCIES}.items():
         if digest(game / name) != expected:
             raise RuntimeError(f"Unsupported or modified file: {name}. No files changed.")
-    shim = (ROOT / "bin/RanceTextFix.dll").read_bytes()
-    if sha(shim) != SHIM_HASH:
-        raise RuntimeError("The bundled patch DLL differs from the tested build.")
+    shim = bundled_shim()
     exe = bytearray((game / "Rance7.exe").read_bytes())
     if exe[SCALE_OFFSET] != 1:
         raise RuntimeError("Unexpected window-scale table.")
@@ -151,21 +158,68 @@ def restore(game, registry, manifest):
     return archive
 
 
+def upgrade(game):
+    """Replace only the tracked font DLL; preserve executable, settings and saves."""
+    ensure_stopped()
+    manifest = read_manifest(game)
+    if manifest["state"] != "installed":
+        raise RuntimeError("An incomplete patch exists. Use uninstall to restore it safely.")
+    expected = manifest["after"][SHIM]
+    if expected not in (LEGACY_SHIM_HASH, SHIM_HASH):
+        raise RuntimeError("Unrecognized installed text DLL version.")
+    for name, required in {**manifest["after"], **DEPENDENCIES}.items():
+        if name != SHIM and digest(game / name) != required:
+            raise RuntimeError(f"{name} changed after installation; refusing to upgrade.")
+    for name, required in BEFORE.items():
+        if digest(game / BACKUP / (name + ".original")) != required:
+            raise RuntimeError(f"Backup is missing or changed: {name}")
+    current = digest(game / SHIM)
+    # If interrupted between the two atomic writes, rerunning upgrade completes
+    # the manifest update. Neither an unrelated DLL nor a downgrade is accepted.
+    if current not in (expected, SHIM_HASH):
+        raise RuntimeError("The installed text DLL changed; refusing to overwrite it.")
+    shim = bundled_shim()
+    if expected == current == SHIM_HASH:
+        print(f"Font patch v{VERSION} is already installed. Keeping current preferences.")
+        return
+    previous = (game / SHIM).read_bytes()
+    if current == LEGACY_SHIM_HASH:
+        backup = game / BACKUP / "RanceTextFix.v0.1.0.dll"
+        if backup.exists() and digest(backup) != LEGACY_SHIM_HASH:
+            raise RuntimeError("Previous patch DLL backup changed; refusing to overwrite it.")
+        if not backup.exists():
+            atomic_write(backup, previous)
+    updated = json.loads(json.dumps(manifest))
+    updated["after"][SHIM] = SHIM_HASH
+    updated["patch_version"] = VERSION
+    try:
+        if current != SHIM_HASH:
+            atomic_write(game / SHIM, shim)
+        save_manifest(game, updated)
+    except Exception as error:
+        try:
+            if current != SHIM_HASH:
+                atomic_write(game / SHIM, previous)
+        except Exception as recovery:
+            raise RuntimeError(f"Font upgrade failed: {error}. Recovery also failed: {recovery}. "
+                               f"Backups remain in {game / BACKUP}; rerun upgrade after resolving "
+                               "the write error.") from error
+        raise RuntimeError(f"Font upgrade failed; previous state retained: {error}") from error
+    print(f"Upgraded the Chinese font patch to v{VERSION}.")
+    print("Executable, window preferences and save files were preserved.")
+
+
 def install(game, registry):
     ensure_stopped()
     if (game / BACKUP).exists():
-        manifest = read_manifest(game)
-        if manifest["state"] == "installed" and all(
-                digest(game / name) == expected for name, expected in manifest["after"].items()):
-            print("Patch is already installed. Keeping current window preferences.")
-            return
-        raise RuntimeError("An incomplete or changed patch exists. Use uninstall to restore it safely.")
+        upgrade(game)
+        return
     if (game / SHIM).exists():
         raise RuntimeError("A text patch DLL already exists without this installer's backup.")
     changed = make_changes(game)
     original_settings = registry.read()
     manifest = {
-        "format": 1, "state": "installing", "before": BEFORE,
+        "format": 1, "state": "installing", "before": BEFORE, "patch_version": VERSION,
         "after": {name: sha(data) for name, data in changed.items()},
         "settings_before": {key: original_settings.get(key) for key in SETTINGS},
         "settings_applied": SETTINGS,
@@ -197,6 +251,7 @@ def status(game, registry):
     if (game / BACKUP).exists():
         manifest = read_manifest(game)
         print("Patch state:", manifest["state"])
+        print("Font patch version:", manifest.get("patch_version", "0.1.0"))
         for name, expected in {**manifest["after"], **DEPENDENCIES}.items():
             print(("OK      " if digest(game / name) == expected else "CHANGED ") + name)
     else:
@@ -209,7 +264,7 @@ def status(game, registry):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("install", "status", "uninstall"))
+    parser.add_argument("action", choices=("install", "upgrade", "status", "uninstall"))
     parser.add_argument("--bottle", default="Steam")
     parser.add_argument("--game-dir", type=Path)
     args = parser.parse_args()
@@ -218,6 +273,8 @@ def main():
     try:
         if args.action == "install":
             install(game, registry)
+        elif args.action == "upgrade":
+            upgrade(game)
         elif args.action == "status":
             status(game, registry)
         else:

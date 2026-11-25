@@ -9,3 +9,6 @@ GetModuleHandleA@4
 GetProcAddress@8
 DisableThreadLibraryCalls@4
 OutputDebugStringA@4
+WideCharToMultiByte@32
+CreateFileA@28
+CloseHandle@4
